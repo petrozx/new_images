@@ -3,13 +3,12 @@
 
 Было:  Управление холдингом, редакция 3.3 (1С:Предприятие КОРП)
 Стало: Управление холдингом, редакция 3.3 (1С:Предприятие)
-
-Остальные пиксели изображения не меняются.
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -17,6 +16,10 @@ from PIL import Image, ImageDraw, ImageFont
 import pytesseract
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+]
 
 
 def _is_dark(c: tuple[int, ...], thresh: int = 110) -> bool:
@@ -25,126 +28,121 @@ def _is_dark(c: tuple[int, ...], thresh: int = 110) -> bool:
 
 def _median_color(samples: list[tuple[int, ...]], q: float = 0.5) -> tuple[int, ...]:
     samples = sorted(samples, key=lambda c: 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2])
-    return samples[int(len(samples) * q)]
+    return samples[max(0, min(len(samples) - 1, int((len(samples) - 1) * q)))]
 
 
-def remove_korp(image: Image.Image, *, top_fraction: float = 0.12) -> tuple[Image.Image, bool]:
-    """Return (edited_image, changed)."""
-    img = image.convert("RGB").copy()
-    w, h = img.size
-    top_h = max(40, int(h * top_fraction))
+def _find_boxes(img: Image.Image, top_h: int):
     data = pytesseract.image_to_data(
-        img.crop((0, 0, w, top_h)), lang="rus+eng", output_type=pytesseract.Output.DICT
+        img.crop((0, 0, img.size[0], top_h)), lang="rus+eng", output_type=pytesseract.Output.DICT
     )
-
-    pred = None
-    korp = None
+    pred = korp = None
     for i, text in enumerate(data["text"]):
         if not text:
             continue
-        box = (data["left"][i], data["top"][i], data["width"][i], data["height"][i])
+        box = (text, data["left"][i], data["top"][i], data["width"][i], data["height"][i])
         if "КОРП" in text:
-            korp = (text, *box)
-        if "Предприят" in text or ("1С" in text and "Пред" in text):
-            pred = (text, *box)
+            korp = box
+        if "Предприят" in text:
+            pred = box
         elif pred is None and "1С" in text:
-            pred = (text, *box)
+            pred = box
+    return pred, korp
 
-    if korp is None:
-        # Fallback: search full image top half
-        data = pytesseract.image_to_data(
-            img.crop((0, 0, w, max(top_h, h // 3))),
-            lang="rus+eng",
-            output_type=pytesseract.Output.DICT,
-        )
-        for i, text in enumerate(data["text"]):
-            if text and "КОРП" in text:
-                korp = (text, data["left"][i], data["top"][i], data["width"][i], data["height"][i])
-            if text and ("Предприят" in text or "1С" in text) and pred is None:
-                pred = (text, data["left"][i], data["top"][i], data["width"][i], data["height"][i])
 
-    if korp is None:
+def remove_korp(image: Image.Image) -> tuple[Image.Image, bool]:
+    img = image.convert("RGB").copy()
+    w, h = img.size
+    pred = korp = None
+    top_h = 40
+    for frac in (0.10, 0.12, 0.15, 0.18, 0.22):
+        top_h = max(40, int(h * frac))
+        pred, korp = _find_boxes(img, top_h)
+        if korp:
+            break
+    if not korp:
         return img, False
 
     _, kx, ky, kw, kh = korp
     if pred is not None:
         _, px, py, pw, ph = pred
-        scan_from, scan_to = px, kx
+        rightmost = px
+        for x in range(px, px + pw):
+            for y in range(max(0, py), min(top_h, py + ph)):
+                if _is_dark(img.getpixel((x, y)), 115):
+                    rightmost = x
+        ocr_end = px + pw - 1
+        if abs(ocr_end - rightmost) <= 8:
+            rightmost = max(rightmost, ocr_end - 1)
     else:
-        px, py, pw, ph = max(0, kx - 200), ky, 200, kh
-        scan_from, scan_to = px, kx
+        rightmost = kx - 8
+        for x in range(max(0, kx - 160), kx - 2):
+            for y in range(max(0, ky), min(top_h, ky + kh)):
+                if _is_dark(img.getpixel((x, y)), 115):
+                    rightmost = x
 
-    rightmost = scan_from
-    for x in range(scan_from, scan_to):
-        for y in range(max(0, ky - 2), min(top_h, ky + kh + 2)):
-            if _is_dark(img.getpixel((x, y)), 110):
-                rightmost = x
-
-    # Yellow/header fill from empty header band
     samples: list[tuple[int, ...]] = []
-    for x in range(min(150, w // 4), min(400, w // 2)):
-        for y in (1, 2, 3, max(1, top_h - 8), max(1, top_h - 7), max(1, top_h - 6)):
-            if y < top_h:
-                samples.append(img.getpixel((x, y)))
-    # Also sample near the cover area but above text
-    for x in range(max(0, kx - 30), min(w, kx + 10)):
-        for y in range(0, max(1, ky - 1)):
+    for x in range(120, min(500, w - 1)):
+        for y in (1, 2, 3, 4):
             samples.append(img.getpixel((x, y)))
-    fill = _median_color(samples, 0.75) if samples else (251, 237, 158)
+        for y in range(max(1, top_h - 6), top_h):
+            samples.append(img.getpixel((x, min(h - 1, y))))
+    fill = _median_color(samples, 0.8) if samples else (251, 237, 158)
 
     draw = ImageDraw.Draw(img)
-    cover_x1 = rightmost + 2
-    cover_x2 = min(w - 1, kx + kw + 6)
+    cover_x1 = rightmost + 1
+    cover_x2 = min(w - 1, kx + kw + 12)
     cover_y1 = 0
-    cover_y2 = min(top_h - 1, max(ky + kh + 8, 35))
+    cover_y2 = min(h - 1, max(36, ky + kh + 12))
     draw.rectangle((cover_x1, cover_y1, cover_x2, cover_y2), fill=fill)
 
-    # Text color from title glyphs
-    ts: list[tuple[int, ...]] = []
-    for x in range(max(0, rightmost - 40), max(1, rightmost - 5)):
-        for y in range(max(0, ky), min(top_h, ky + kh)):
+    for x in range(cover_x1, cover_x2 + 1):
+        for y in range(cover_y1, cover_y2 + 1):
             c = img.getpixel((x, y))
-            if _is_dark(c, 90):
-                ts.append(c)
+            if _is_dark(c, 140) or (
+                c[0] < 180 and c[1] < 180 and abs(c[0] - c[1]) < 40 and c[0] < fill[0] - 30
+            ):
+                img.putpixel((x, y), fill)
+
+    ts: list[tuple[int, ...]] = []
+    if pred is not None:
+        _, px, py, pw, ph = pred
+        for x in range(px + 10, max(px + 11, rightmost - 5)):
+            for y in range(py, py + ph):
+                c = img.getpixel((x, y))
+                if _is_dark(c, 90):
+                    ts.append(c)
     text_color = _median_color(ts, 0.5) if ts else (51, 51, 51)
 
     font = None
-    for size in (13, 12, 14, 11, 15):
-        for fp in (
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/packages/agent-controller/assets/media/fonts/Inter/Inter-Regular.ttf",
-        ):
+    for size in (13, 12, 14):
+        for fp in FONT_CANDIDATES:
             try:
                 f = ImageFont.truetype(fp, size)
+                bb = f.getbbox(")")
+                if 12 <= bb[3] - bb[1] <= 15:
+                    font = f
+                    break
             except OSError:
-                continue
-            bb = f.getbbox(")")
-            if 12 <= (bb[3] - bb[1]) <= 16:
-                font = f
-                break
+                pass
         if font:
             break
     if font is None:
         font = ImageFont.load_default()
 
     tops: list[int] = []
-    for x in range(max(0, rightmost - 30), rightmost):
-        for y in range(5, min(top_h, 30)):
+    for x in range(max(0, rightmost - 40), rightmost):
+        for y in range(5, 28):
             if _is_dark(img.getpixel((x, y)), 110):
                 tops.append(y)
                 break
-    avg_top = int(sum(tops) / len(tops)) if tops else max(8, ky)
+    avg_top = int(sum(tops) / len(tops)) if tops else 10
     bb = font.getbbox(")")
-    paren_x = rightmost + 2
-    paren_y = avg_top - bb[1] - 1
-    draw.text((paren_x, paren_y), ")", fill=text_color, font=font)
+    draw.text((rightmost + 2, avg_top - bb[1] - 1), ")", fill=text_color, font=font)
     return img, True
 
 
-def process_path(src: Path, dst: Path, *, top_fraction: float) -> str:
-    img = Image.open(src)
-    edited, changed = remove_korp(img, top_fraction=top_fraction)
+def process_path(src: Path, dst: Path) -> str:
+    edited, changed = remove_korp(Image.open(src))
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.suffix.lower() in {".jpg", ".jpeg"}:
         edited.save(dst, quality=95)
@@ -155,14 +153,8 @@ def process_path(src: Path, dst: Path, *, top_fraction: float) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", type=Path, help="Скриншот или папка")
-    parser.add_argument("-o", "--output", type=Path, help="Файл или папка результата")
-    parser.add_argument("--top-fraction", type=float, default=0.12)
-    parser.add_argument(
-        "--in-place",
-        action="store_true",
-        help="Перезаписать исходники (иначе пишем *_bez_korp рядом / в -o)",
-    )
+    parser.add_argument("input", type=Path)
+    parser.add_argument("-o", "--output", type=Path)
     args = parser.parse_args(argv)
 
     if args.input.is_dir():
@@ -172,22 +164,19 @@ def main(argv: list[str] | None = None) -> int:
         if not inputs:
             print(f"Нет изображений в {args.input}", file=sys.stderr)
             return 1
-        changed = 0
+        n = 0
         for src in inputs:
-            dst = src if args.in_place else out_dir / f"{src.stem}_bez_korp{src.suffix}"
-            status = process_path(src, dst, top_fraction=args.top_fraction)
-            print(f"{src.name}: {status} -> {dst}")
+            dst = out_dir / f"{src.stem}_bez_korp{src.suffix}"
+            status = process_path(src, dst)
+            print(f"{src.name}: {status} -> {dst.name}")
             if status == "ok":
-                changed += 1
-        print(f"Итого изменено: {changed}/{len(inputs)}")
-        return 0 if changed else 2
+                n += 1
+        print(f"Итого: {n}/{len(inputs)}")
+        return 0 if n else 2
 
     src = args.input
-    if args.in_place:
-        dst = src
-    else:
-        dst = args.output or src.with_name(f"{src.stem}_bez_korp{src.suffix or '.png'}")
-    status = process_path(src, dst, top_fraction=args.top_fraction)
+    dst = args.output or src.with_name(f"{src.stem}_bez_korp{src.suffix or '.png'}")
+    status = process_path(src, dst)
     print(f"{src.name}: {status} -> {dst}")
     return 0 if status == "ok" else 2
 
