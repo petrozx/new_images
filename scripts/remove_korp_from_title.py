@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """Точечно убрать «КОРП» из заголовка окна 1С на скриншотах.
 
-Было:  Управление холдингом, редакция 3.3 (1С:Предприятие КОРП)
-Стало: Управление холдингом, редакция 3.3 (1С:Предприятие)
+Заливка — жёлтый цвет шапки (не белый). Остальной кадр не меняется.
 """
 
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from pathlib import Path
 
@@ -16,22 +14,31 @@ from PIL import Image, ImageDraw, ImageFont
 import pytesseract
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
-FONT_CANDIDATES = [
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-]
+FONT = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
 
 
-def _is_dark(c: tuple[int, ...], thresh: int = 110) -> bool:
+def _is_dark(c, thresh=110):
     return c[0] < thresh and c[1] < thresh and c[2] < thresh
 
 
-def _median_color(samples: list[tuple[int, ...]], q: float = 0.5) -> tuple[int, ...]:
-    samples = sorted(samples, key=lambda c: 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2])
-    return samples[max(0, min(len(samples) - 1, int((len(samples) - 1) * q)))]
+def _header_yellow_at_row(img, y, w):
+    samples = []
+    for x in range(min(w - 20, 700), min(w - 5, 900)):
+        c = img.getpixel((x, y))
+        if c[0] > 220 and c[1] > 200 and c[2] < 200:
+            samples.append(c)
+    if not samples:
+        for x in range(620, min(w - 5, 780)):
+            c = img.getpixel((x, y))
+            if c[0] > 220 and c[1] > 200 and c[2] < 200:
+                samples.append(c)
+    if samples:
+        n = len(samples)
+        return tuple(sum(c[i] for c in samples) // n for i in range(3))
+    return (251, 237, 158)
 
 
-def _find_boxes(img: Image.Image, top_h: int):
+def _find_boxes(img, top_h):
     data = pytesseract.image_to_data(
         img.crop((0, 0, img.size[0], top_h)), lang="rus+eng", output_type=pytesseract.Output.DICT
     )
@@ -49,7 +56,7 @@ def _find_boxes(img: Image.Image, top_h: int):
     return pred, korp
 
 
-def remove_korp(image: Image.Image) -> tuple[Image.Image, bool]:
+def remove_korp(image: Image.Image):
     img = image.convert("RGB").copy()
     w, h = img.size
     pred = korp = None
@@ -74,70 +81,45 @@ def remove_korp(image: Image.Image) -> tuple[Image.Image, bool]:
         if abs(ocr_end - rightmost) <= 8:
             rightmost = max(rightmost, ocr_end - 1)
     else:
-        rightmost = kx - 8
-        for x in range(max(0, kx - 160), kx - 2):
-            for y in range(max(0, ky), min(top_h, ky + kh)):
-                if _is_dark(img.getpixel((x, y)), 115):
-                    rightmost = x
+        rightmost = kx - 6
 
-    samples: list[tuple[int, ...]] = []
-    for x in range(120, min(500, w - 1)):
-        for y in (1, 2, 3, 4):
-            samples.append(img.getpixel((x, y)))
-        for y in range(max(1, top_h - 6), top_h):
-            samples.append(img.getpixel((x, min(h - 1, y))))
-    fill = _median_color(samples, 0.8) if samples else (251, 237, 158)
+    x1, x2 = rightmost + 1, min(w - 1, kx + kw + 4)
+    y1, y2 = max(0, ky - 2), min(34, ky + kh + 3)
 
-    draw = ImageDraw.Draw(img)
-    cover_x1 = rightmost + 1
-    cover_x2 = min(w - 1, kx + kw + 12)
-    cover_y1 = 0
-    cover_y2 = min(h - 1, max(36, ky + kh + 12))
-    draw.rectangle((cover_x1, cover_y1, cover_x2, cover_y2), fill=fill)
+    for y in range(y1, y2 + 1):
+        fill = _header_yellow_at_row(img, y, w)
+        for x in range(x1, x2 + 1):
+            img.putpixel((x, y), fill)
 
-    for x in range(cover_x1, cover_x2 + 1):
-        for y in range(cover_y1, cover_y2 + 1):
-            c = img.getpixel((x, y))
-            if _is_dark(c, 140) or (
-                c[0] < 180 and c[1] < 180 and abs(c[0] - c[1]) < 40 and c[0] < fill[0] - 30
-            ):
-                img.putpixel((x, y), fill)
-
-    ts: list[tuple[int, ...]] = []
+    ts = []
     if pred is not None:
         _, px, py, pw, ph = pred
-        for x in range(px + 10, max(px + 11, rightmost - 5)):
+        for x in range(px + 20, max(px + 21, rightmost - 5)):
             for y in range(py, py + ph):
                 c = img.getpixel((x, y))
                 if _is_dark(c, 90):
                     ts.append(c)
-    text_color = _median_color(ts, 0.5) if ts else (51, 51, 51)
+    text_color = (51, 51, 51)
+    if ts:
+        n = len(ts)
+        text_color = tuple(sum(c[i] for c in ts) // n for i in range(3))
 
-    font = None
-    for size in (13, 12, 14):
-        for fp in FONT_CANDIDATES:
-            try:
-                f = ImageFont.truetype(fp, size)
-                bb = f.getbbox(")")
-                if 12 <= bb[3] - bb[1] <= 15:
-                    font = f
-                    break
-            except OSError:
-                pass
-        if font:
-            break
-    if font is None:
+    try:
+        font = ImageFont.truetype(FONT, 13)
+    except OSError:
         font = ImageFont.load_default()
 
-    tops: list[int] = []
+    tops = []
     for x in range(max(0, rightmost - 40), rightmost):
         for y in range(5, 28):
             if _is_dark(img.getpixel((x, y)), 110):
                 tops.append(y)
                 break
-    avg_top = int(sum(tops) / len(tops)) if tops else 10
+    avg_top = int(sum(tops) / len(tops)) if tops else ky
     bb = font.getbbox(")")
-    draw.text((rightmost + 2, avg_top - bb[1] - 1), ")", fill=text_color, font=font)
+    ImageDraw.Draw(img).text(
+        (rightmost + 2, avg_top - bb[1] - 1), ")", fill=text_color, font=font
+    )
     return img, True
 
 
@@ -151,7 +133,7 @@ def process_path(src: Path, dst: Path) -> str:
     return "ok" if changed else "no-korp"
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path)
     parser.add_argument("-o", "--output", type=Path)
@@ -169,8 +151,7 @@ def main(argv: list[str] | None = None) -> int:
             dst = out_dir / f"{src.stem}_bez_korp{src.suffix}"
             status = process_path(src, dst)
             print(f"{src.name}: {status} -> {dst.name}")
-            if status == "ok":
-                n += 1
+            n += status == "ok"
         print(f"Итого: {n}/{len(inputs)}")
         return 0 if n else 2
 
