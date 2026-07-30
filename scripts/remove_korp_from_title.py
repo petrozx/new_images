@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Точечно убрать «КОРП» из заголовка окна 1С на скриншотах.
 
-Заливка — жёлтый цвет шапки (не белый). Остальной кадр не меняется.
+Не задевает букву «е» в слове «Предприятие».
+Заливка — жёлтый цвет шапки. Остальной кадр не меняется.
 """
 
 from __future__ import annotations
@@ -70,35 +71,33 @@ def remove_korp(image: Image.Image):
         return img, False
 
     _, kx, ky, kw, kh = korp
-    if pred is not None:
-        _, px, py, pw, ph = pred
-        rightmost = px
-        for x in range(px, px + pw):
-            for y in range(max(0, py), min(top_h, py + ph)):
-                if _is_dark(img.getpixel((x, y)), 115):
-                    rightmost = x
-        ocr_end = px + pw - 1
-        if abs(ocr_end - rightmost) <= 8:
-            rightmost = max(rightmost, ocr_end - 1)
-    else:
-        rightmost = kx - 6
 
-    x1, x2 = rightmost + 1, min(w - 1, kx + kw + 4)
-    y1, y2 = max(0, ky - 2), min(34, ky + kh + 3)
+    # Last dark pixel of «Предприятие» — never scan into the gap before КОРП
+    scan_end = max(0, kx - 5)
+    scan_start = pred[1] if pred is not None else max(0, kx - 180)
+    rightmost = scan_start
+    for x in range(scan_start, scan_end):
+        for y in range(max(0, ky - 2), min(top_h, ky + kh + 2)):
+            if _is_dark(img.getpixel((x, y)), 115):
+                rightmost = x
 
-    for y in range(y1, y2 + 1):
+    # Cover only space + КОРП; keep full «е» (rightmost) intact
+    cover_x1 = max(rightmost + 2, kx - 5)
+    cover_x2 = min(w - 1, kx + kw + 3)
+    cover_y1 = max(0, ky - 2)
+    cover_y2 = min(34, ky + kh + 3)
+
+    for y in range(cover_y1, cover_y2 + 1):
         fill = _header_yellow_at_row(img, y, w)
-        for x in range(x1, x2 + 1):
+        for x in range(cover_x1, cover_x2 + 1):
             img.putpixel((x, y), fill)
 
     ts = []
-    if pred is not None:
-        _, px, py, pw, ph = pred
-        for x in range(px + 20, max(px + 21, rightmost - 5)):
-            for y in range(py, py + ph):
-                c = img.getpixel((x, y))
-                if _is_dark(c, 90):
-                    ts.append(c)
+    for x in range(max(0, rightmost - 40), rightmost):
+        for y in range(cover_y1, cover_y2 + 1):
+            c = img.getpixel((x, y))
+            if _is_dark(c, 90):
+                ts.append(c)
     text_color = (51, 51, 51)
     if ts:
         n = len(ts)
